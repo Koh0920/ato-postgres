@@ -71,4 +71,4 @@ secret = true
 [contracts."service@1".state]
 required = true
 version  = "16"
-mount    = "PGDATA"
+mount    = "/var/lib/postgresql/data"
