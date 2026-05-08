@@ -1,12 +1,20 @@
 #!/bin/bash
-# Postgres provider bootstrap for P7 (since [provision] block execution
-# is deferred from v1 MVP, we embed init-or-exec in this wrapper script).
+# Postgres provider bootstrap.
 #
 # Args: $1 = state_dir, $2 = port, $3 = path to credential file
 #
 # RFC §7.3.2 Rule M1: the credential is materialized as a temp file with
 # 0600 perms. The password file is unlinked by the orchestrator at
 # teardown.
+#
+# Tool binaries: this capsule declares `tool_artifacts = ["postgresql"]`
+# in capsule.toml. ato-cli (≥ 0.5.x) downloads + sha256-verifies the
+# pinned upstream Postgres distribution into $ATO_HOME/store/tools/...
+# and injects the resolved paths via env. We require the env vars
+# below — if any are missing, ato-cli is older than 0.5.x and this
+# capsule cannot run on this host. Older ato-cli versions called
+# /opt/homebrew/bin/* directly; that contract is removed (see
+# ato-run/ato#119, #120).
 #
 # Password lifecycle:
 #   - First init: initdb --pwfile=<path> bakes PG_PASSWORD into pg_authid.
@@ -15,17 +23,32 @@
 #     rotates the secret deliberately). We rewrite pg_authid via single-
 #     user mode (`postgres --single`) before the regular postmaster
 #     starts, so the consumer's psycopg.connect(DATABASE_URL) always
-#     uses the same value as ato's runtime_exports template. Without
-#     this, a password mismatch surfaces only as a generic
-#     `FATAL: password authentication failed for user "postgres"` from
-#     the consumer's lifespan and every subsequent run breaks until the
-#     user manually wipes the state dir.
+#     uses the same value as ato's runtime_exports template.
 
 set -eu
 
 STATE_DIR="$1"
 PORT="$2"
 PWFILE="$3"
+
+require_tool_env() {
+  local var="$1"
+  local val="${!var:-}"
+  if [ -z "$val" ]; then
+    echo "[ato/postgres bootstrap] FATAL: $var is unset." >&2
+    echo "[ato/postgres bootstrap] This capsule requires ato-cli >= 0.5.x with the tool artifact resolver." >&2
+    echo "[ato/postgres bootstrap] Older ato-cli versions injected /opt/homebrew/bin/* directly; that path is removed." >&2
+    exit 78  # EX_CONFIG
+  fi
+  if [ ! -x "$val" ]; then
+    echo "[ato/postgres bootstrap] FATAL: $var=$val is not executable." >&2
+    exit 78
+  fi
+}
+
+require_tool_env ATO_TOOL_INITDB
+require_tool_env ATO_TOOL_POSTGRES
+require_tool_env ATO_TOOL_PG_CTL
 
 PGDATA="${STATE_DIR}/pgdata"
 
@@ -41,7 +64,7 @@ PG_OPTS=(
 
 if [ ! -f "${PGDATA}/PG_VERSION" ]; then
   echo "[ato/postgres bootstrap] initdb at ${PGDATA}" >&2
-  /opt/homebrew/bin/initdb \
+  "${ATO_TOOL_INITDB}" \
     -D "${PGDATA}" \
     --encoding=UTF8 \
     --username=postgres \
@@ -49,18 +72,20 @@ if [ ! -f "${PGDATA}/PG_VERSION" ]; then
     --auth-host=password \
     --pwfile="${PWFILE}" \
     --no-instructions >&2
+
   if [ -n "${ATO_PG_DATABASE:-}" ]; then
-    echo "[ato/postgres bootstrap] creating database ${ATO_PG_DATABASE}" >&2
-    /opt/homebrew/bin/pg_ctl \
-      -D "${PGDATA}" \
-      -l "${PGDATA}/init.log" \
-      -o "-p ${PORT} ${PG_OPTS[*]}" \
-      -w start
-    PGPASSWORD="$(cat "${PWFILE}")" \
-      /opt/homebrew/bin/createdb \
-      -h 127.0.0.1 -p "${PORT}" -U postgres \
-      "${ATO_PG_DATABASE}"
-    /opt/homebrew/bin/pg_ctl -D "${PGDATA}" -m fast stop
+    # The verified Postgres tool artifact deliberately omits `createdb`
+    # and `psql` (zonky's relocatable distribution ships only initdb,
+    # postgres, pg_ctl). Use postgres single-user mode (`--single`) to
+    # run the CREATE DATABASE SQL directly against the catalog —
+    # network-less, authentication-less, intended exactly for one-shot
+    # init.
+    echo "[ato/postgres bootstrap] creating database ${ATO_PG_DATABASE} via postgres --single" >&2
+    echo "CREATE DATABASE \"${ATO_PG_DATABASE}\";" | \
+      "${ATO_TOOL_POSTGRES}" --single \
+        -D "${PGDATA}" \
+        -c unix_socket_directories= \
+        postgres >&2
   fi
   echo "[ato/postgres bootstrap] init complete" >&2
 else
@@ -78,7 +103,7 @@ else
     ESCAPED_PASSWORD="${NEW_PASSWORD//\'/\'\'}"
     echo "[ato/postgres bootstrap] aligning postgres password with current PG_PASSWORD" >&2
     if ! printf "ALTER ROLE postgres WITH PASSWORD '%s';\n" "${ESCAPED_PASSWORD}" \
-         | /opt/homebrew/bin/postgres --single \
+         | "${ATO_TOOL_POSTGRES}" --single \
             -D "${PGDATA}" \
             -c unix_socket_directories= \
             postgres >&2; then
@@ -88,7 +113,7 @@ else
 fi
 
 echo "[ato/postgres bootstrap] starting postgres on 127.0.0.1:${PORT}" >&2
-exec /opt/homebrew/bin/postgres \
+exec "${ATO_TOOL_POSTGRES}" \
   -D "${PGDATA}" \
   -p "${PORT}" \
   "${PG_OPTS[@]}"

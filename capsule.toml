@@ -3,25 +3,29 @@
 # Implements `service@1` contract. Consumers declare:
 #
 #   [dependencies.db]
-#   capsule  = "capsule://ato/postgres@16"
+#   capsule  = "capsule://github.com/Koh0920/ato-postgres@<40-char-sha>"
 #   contract = "service@1"
 #   parameters.database = "myapp"
 #   credentials.password = "{{env.PG_PASSWORD}}"
 #   [dependencies.db.state]
 #   name = "data"
 #
-# This is the P7 fixture form: a local directory exercising the new RFC
-# grammar against the real postgres binary on the host.
+# Postgres binaries come from ato-cli's verified tool artifact resolver
+# (#119/#120). The capsule declares `tool_artifacts = ["postgresql"]`
+# under [targets.server]; ato-cli ≥ 0.5.x downloads, sha256-verifies,
+# and unpacks the pinned distribution into $ATO_HOME/store/tools/...,
+# then injects ATO_TOOL_INITDB / POSTGRES / PG_CTL into the provider
+# environment. There is no host /opt/homebrew or /usr/local dependency.
 
 schema_version = "0.3"
 name           = "postgres"
-version        = "16.0.0"
+version        = "16.1.0"
 type           = "app"
 default_target = "server"
 
 [metadata]
 display_name = "PostgreSQL (capsule provider)"
-description  = "Postgres 14+ exposed as an Ato service@1 provider"
+description  = "Postgres 16 exposed as an Ato service@1 provider — clean-host via verified tool artifact"
 author       = "ato"
 
 [targets.server]
@@ -36,16 +40,29 @@ driver   = "native"
 # port=None on the parsed NamedTarget as port="auto").
 run = "./bootstrap.sh {{state.dir}} {{port}} {{credentials.password}}"
 working_dir = "."
+# Declare the postgresql tool artifact. ato-cli (≥ 0.5.x) resolves it
+# from its built-in registry against an Ato-managed verified download
+# and exposes the binaries through ATO_TOOL_* env. No host package
+# manager dependency.
+tool_artifacts = ["postgresql"]
 
 # Inject the target database name via env so the bootstrap script can
-# decide whether to createdb on first init. The script reads
+# decide whether to create the database on first init. The script reads
 # ATO_PG_DATABASE.
 [targets.server.env]
 ATO_PG_DATABASE = "wasedap2p"
 
 [contracts."service@1"]
 target = "server"
-ready  = { type = "probe", run = "/opt/homebrew/bin/pg_isready -h 127.0.0.1 -p {{port}}", timeout = "90s" }
+# Native "accepting connections" probe — orchestration-layer drop-in
+# for `pg_isready`. ato-cli sends a Postgres v3 StartupMessage and
+# treats Authentication{Ok,CleartextPassword,MD5Password,SASL*},
+# ReadyForQuery, and auth-class ErrorResponse (SQLSTATE 28xxx) as
+# accepting; ECONNREFUSED, read timeout, SQLSTATE 57P03
+# (cannot_connect_now), and protocol violations as not-ready. See
+# crates/ato-cli/src/application/dependency_runtime/ready.rs in
+# ato-run/ato for the full classification.
+ready  = { type = "postgres", host = "127.0.0.1", port = "{{port}}", user = "postgres", database = "postgres", timeout = "30s" }
 
 [contracts."service@1".parameters]
 database = { type = "string", required = true }
